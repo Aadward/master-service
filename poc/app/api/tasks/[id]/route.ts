@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { buildCustomerMinData } from "@/lib/customer-shape";
 
 /**
  * GET /api/tasks/{id}
@@ -16,7 +17,9 @@ export async function GET(
   const task = await db.configTask.findUnique({
     where: { taskId },
     include: {
-      customer: true,
+      customer: {
+        include: { locations: true },
+      },
     },
   });
   if (!task) return NextResponse.json({ code: "NOT_FOUND" }, { status: 404 });
@@ -45,14 +48,6 @@ export async function GET(
     readyAt: task.readyAt,
     startedAt: task.startedAt,
     completedAt: task.completedAt,
-    customerMinData: {
-      customerId: task.customer.customerId,
-      name: task.customer.name,
-      country: task.customer.country,
-      industry: task.customer.industry,
-      customerType: task.customer.customerType,
-      legalEntity: task.customer.legalEntity,
-      defaultCurrency: task.customer.defaultCurrency,
-    },
+    customerMinData: buildCustomerMinData(task.customer, task.customer.locations),
   });
 }

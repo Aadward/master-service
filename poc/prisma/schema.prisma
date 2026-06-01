@@ -9,31 +9,61 @@ datasource db {
 
 // ============================================================
 // Customer · 客户主数据（最小集合）
-// 注意：master-service 仅维护各域交集字段，不存任何域内自定义配置
+// 仅维护各域交集字段，不存任何域内自定义配置
 // ============================================================
 model Customer {
-  customerId       String       @id
-  externalRef      String?      @unique
-  name             String
-  country          String?
-  industry         String?
-  customerType     String
-  legalEntity      String?
-  defaultCurrency  String?
+  customerId       String              @id  // 内部 PK，自增 "C0001"
 
-  overallStatus    String       // INIT | IN_PROGRESS | READY | PARTIAL | CANCELLED
+  // 用户填入的最小集合
+  custNo           String              @unique @map("cust_no")
+  custName         String              @map("cust_name")
+  globalCustNo     String?             @map("global_cust_no")
+  globalCustName   String?             @map("global_cust_name")
+  globalCustCode   String?             @map("global_cust_code")
+  regionNo         String?             @map("region_no")
+  companyNo        String?             @map("company_no")
+  isMaster         Boolean             @default(false) @map("is_master")
+  isInterCompany   Boolean             @default(false) @map("is_inter_company")
+
+  externalRef      String?             @unique
+
+  // 内部：模板选择键（默认；POC 暂只有 standard_b2b）
+  customerType     String              @default("standard_b2b")
+
+  // 整体状态
+  overallStatus    String
   templateId       String
   templateVersion  Int
 
-  createdAt        DateTime     @default(now())
+  // 元信息
+  createdAt        DateTime            @default(now())
   createdBy        String?
-  updatedAt        DateTime     @updatedAt
+  updatedAt        DateTime            @updatedAt
   updatedBy        String?
 
   tasks            ConfigTask[]
   audits           AuditLog[]
+  locations        CustomerLocation[]
 
   @@index([overallStatus])
+}
+
+// ============================================================
+// CustomerLocation · 客户 × 域 × 位置号（一对多）
+// 每个 (customerId, domain) 至多一条
+// 例: { customerId: "C0001", domain: "sales",   locNo: "LOC-SLS-001" }
+//     { customerId: "C0001", domain: "mfg",     locNo: "LOC-MFG-001" }
+// ============================================================
+model CustomerLocation {
+  id          Int      @id @default(autoincrement())
+  customerId  String
+  customer    Customer @relation(fields: [customerId], references: [customerId], onDelete: Cascade)
+  domain      String   // 'mfg' / 'sales' / 'crm' / 'finance' / 'plm' / ...
+  locNo       String   @map("loc_no")
+  createdAt   DateTime @default(now())
+
+  @@unique([customerId, domain])
+  @@index([customerId])
 }
 
 // ============================================================
@@ -48,41 +78,37 @@ model ConfigTask {
   taskKey                   String
   pageRef                   String?
 
-  status                    String    // WAITING/READY/CLAIMED/IN_PROGRESS/DONE/FAILED/SKIPPED/BLOCKED/CANCELLED
-  dependsOnJson             String    // JSON array of task_key strings
+  status                    String
+  dependsOnJson             String
 
-  // 派生快照：READY 时冻结，之后不随 min_data 变化重算
-  suggestedConfigSnapshot   String?   // JSON
+  suggestedConfigSnapshot   String?
 
-  // 认领信息
   claimOwner                String?
   claimedAt                 DateTime?
   claimTimeoutAt            DateTime?
 
-  // 重试 / 失败
   retryCount                Int       @default(0)
   lastErrorCode             String?
   lastErrorMsg              String?
 
-  // 时间戳
   createdAt                 DateTime  @default(now())
   readyAt                   DateTime?
   startedAt                 DateTime?
   completedAt               DateTime?
 
-  @@unique([customerId, taskKey])    // 幂等关键约束
+  @@unique([customerId, taskKey])
   @@index([customerId, status])
   @@index([module, status])
 }
 
 // ============================================================
-// ConfigTemplate · 模板（按 customer_type 分，可版本化）
+// ConfigTemplate · 模板
 // ============================================================
 model ConfigTemplate {
   templateId    String
   version       Int
   customerType  String
-  definition    String      // JSON 字符串：modules → tasks → suggestions
+  definition    String
   isActive      Boolean     @default(false)
   createdAt     DateTime    @default(now())
 
@@ -91,31 +117,31 @@ model ConfigTemplate {
 }
 
 // ============================================================
-// LookupTable · 字典（${lookup.X[...]} 表达式引用）
+// LookupTable · 字典
 // ============================================================
 model LookupTable {
   name        String   @id
   version     Int
-  entries     String   // JSON
+  entries     String
   description String?
   updatedAt   DateTime @updatedAt
   updatedBy   String?
 }
 
 // ============================================================
-// AuditLog · 审计日志（不可篡改的状态迁移记录）
+// AuditLog · 审计
 // ============================================================
 model AuditLog {
   id          Int       @id @default(autoincrement())
   customerId  String?
   customer    Customer? @relation(fields: [customerId], references: [customerId], onDelete: Cascade)
   taskId      Int?
-  eventType   String    // task_state_change | customer_create | template_apply
+  eventType   String
   fromStatus  String?
   toStatus    String?
-  actor       String?   // system | user:xxx | downstream:sales-pod-7
+  actor       String?
   reason      String?
-  extra       String?   // JSON 任意附加上下文
+  extra       String?
   createdAt   DateTime  @default(now())
 
   @@index([taskId, createdAt])
@@ -124,9 +150,8 @@ model AuditLog {
 
 // ============================================================
 // Counter · 用于生成有序、无冲突的 customer_id 等序列号
-// （SQLite + Prisma 不支持原生 sequence，用一行 upsert+increment 模拟）
 // ============================================================
 model Counter {
-  name   String @id   // e.g. "customer_seq"
+  name   String @id
   value  Int    @default(0)
 }

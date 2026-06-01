@@ -4,6 +4,7 @@ import { evaluateSuggestions } from "./expression-evaluator";
 import { findTaskDefInTemplate, loadTemplate } from "./template-engine";
 import { TaskStatus, SuccessorTriggerStatuses, type CustomerMinData, type TemplateDef } from "./types";
 import { refreshOverallStatus } from "./status-aggregator";
+import { buildCustomerMinData } from "./customer-shape";
 import type { Prisma } from "@prisma/client";
 
 /**
@@ -84,20 +85,15 @@ export async function onTaskTerminal(taskId: number): Promise<{
   let newlyReady: ActivationResult[] = [];
 
   if (SuccessorTriggerStatuses.includes(task.status as any)) {
-    const customer = await db.customer.findUnique({ where: { customerId: task.customerId } });
+    const customer = await db.customer.findUnique({
+      where: { customerId: task.customerId },
+      include: { locations: true },
+    });
     if (!customer) return { newlyReady };
     const tmpl = await loadTemplate(customer.templateId, customer.templateVersion);
     if (!tmpl) return { newlyReady };
     const lookups = await loadAllLookups();
-    const minData: CustomerMinData = {
-      customerId: customer.customerId,
-      name: customer.name,
-      country: customer.country,
-      industry: customer.industry,
-      customerType: customer.customerType,
-      legalEntity: customer.legalEntity,
-      defaultCurrency: customer.defaultCurrency,
-    };
+    const minData: CustomerMinData = buildCustomerMinData(customer, customer.locations);
 
     newlyReady = await db.$transaction(async (tx) => {
       // 在事务内重新查"已完成键集合"，确保看到的是最新视图
@@ -131,20 +127,15 @@ export async function onTaskTerminal(taskId: number): Promise<{
  * 找入度=0 的任务，事务内全部激活为 READY
  */
 export async function activateInitialTasks(customerId: string): Promise<ActivationResult[]> {
-  const customer = await db.customer.findUnique({ where: { customerId } });
+  const customer = await db.customer.findUnique({
+    where: { customerId },
+    include: { locations: true },
+  });
   if (!customer) return [];
   const tmpl = await loadTemplate(customer.templateId, customer.templateVersion);
   if (!tmpl) return [];
   const lookups = await loadAllLookups();
-  const minData: CustomerMinData = {
-    customerId: customer.customerId,
-    name: customer.name,
-    country: customer.country,
-    industry: customer.industry,
-    customerType: customer.customerType,
-    legalEntity: customer.legalEntity,
-    defaultCurrency: customer.defaultCurrency,
-  };
+  const minData: CustomerMinData = buildCustomerMinData(customer, customer.locations);
 
   const out = await db.$transaction(async (tx) => {
     // 初始激活时"完成键集合"为空 → 只有无依赖的任务会被激活
@@ -170,20 +161,15 @@ export async function recomputeReadyTasks(
   customerId: string,
   reason = "recompute after manual change"
 ): Promise<ActivationResult[]> {
-  const customer = await db.customer.findUnique({ where: { customerId } });
+  const customer = await db.customer.findUnique({
+    where: { customerId },
+    include: { locations: true },
+  });
   if (!customer) return [];
   const tmpl = await loadTemplate(customer.templateId, customer.templateVersion);
   if (!tmpl) return [];
   const lookups = await loadAllLookups();
-  const minData: CustomerMinData = {
-    customerId: customer.customerId,
-    name: customer.name,
-    country: customer.country,
-    industry: customer.industry,
-    customerType: customer.customerType,
-    legalEntity: customer.legalEntity,
-    defaultCurrency: customer.defaultCurrency,
-  };
+  const minData: CustomerMinData = buildCustomerMinData(customer, customer.locations);
 
   const out = await db.$transaction(async (tx) => {
     const all = await tx.configTask.findMany({

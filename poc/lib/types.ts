@@ -90,14 +90,24 @@ export interface TemplateDef {
 
 /**
  * 客户最小集合的字段集
- * 这里只是 TS 类型；真正的最小集合定义在 docs/01-design-overview.md
+ * 这里只是 TS 类型；真正的"什么进入 minimum"由业务定义
+ *
+ * 注意：locations 在 API 返回的 customerMinData 里会被扁平化为
+ * `${domain}_loc_no` 形式，方便模板表达式直接引用
+ * （例如 ${customer.sales_loc_no}）。
  */
 export interface CustomerMinData {
   customerId: string;
-  name: string;
-  country?: string | null;
-  industry?: string | null;
+  custNo: string;
+  custName: string;
+  globalCustNo?: string | null;
+  globalCustName?: string | null;
+  globalCustCode?: string | null;
+  regionNo?: string | null;
+  companyNo?: string | null;
+  isMaster?: boolean;
+  isInterCompany?: boolean;
   customerType: string;
-  legalEntity?: string | null;
-  defaultCurrency?: string | null;
+  // 扁平化的 location 字段（动态 key，由 API 注入）
+  [extraLocKey: string]: unknown;
 }

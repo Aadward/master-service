@@ -8,14 +8,19 @@ import ProgressBar from "@/components/ProgressBar";
 
 interface CustomerRow {
   customerId: string;
-  name: string;
-  country?: string;
-  industry?: string;
+  custNo: string;
+  custName: string;
+  globalCustNo?: string | null;
+  regionNo?: string | null;
+  companyNo?: string | null;
+  isMaster: boolean;
+  isInterCompany: boolean;
   customerType: string;
   overallStatus: string;
   tasksTotal: number;
   tasksDone: number;
   tasksFailed: number;
+  locationsCount: number;
   createdAt: string;
 }
 
@@ -75,11 +80,28 @@ export default function DashboardPage() {
                 href={`/customers/${c.customerId}`}
                 className="flex items-center gap-4 py-3 transition hover:bg-slate-50"
               >
-                <div className="w-16 font-mono text-sm text-slate-500">{c.customerId}</div>
+                <div className="w-28 font-mono text-sm text-slate-700">{c.custNo}</div>
                 <div className="flex-1">
-                  <div className="font-medium text-slate-900">{c.name}</div>
-                  <div className="text-xs text-slate-500">
-                    {c.country} · {c.industry} · {c.customerType}
+                  <div className="font-medium text-slate-900">{c.custName}</div>
+                  <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <span>{c.regionNo ?? "—"}</span>
+                    <span className="text-slate-300">·</span>
+                    <span>company {c.companyNo ?? "—"}</span>
+                    {c.isMaster && (
+                      <span className="rounded bg-indigo-100 px-1 py-0.5 text-[10px] font-semibold text-indigo-700">
+                        master
+                      </span>
+                    )}
+                    {c.isInterCompany && (
+                      <span className="rounded bg-violet-100 px-1 py-0.5 text-[10px] font-semibold text-violet-700">
+                        inter-company
+                      </span>
+                    )}
+                    {c.locationsCount > 0 && (
+                      <span className="text-[11px] text-slate-400">
+                        · {c.locationsCount} loc
+                      </span>
+                    )}
                   </div>
                 </div>
                 <div className="w-48">

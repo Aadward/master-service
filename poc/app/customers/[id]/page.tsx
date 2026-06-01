@@ -12,6 +12,7 @@ import DAGViewer, { type DAGTaskInput, type DAGEdgeInput } from "@/components/DA
 import TaskDetailPanel, { type PanelTask } from "@/components/TaskDetailPanel";
 import DemoHelper from "@/components/DemoHelper";
 import RecentActivity from "@/components/RecentActivity";
+import MinDataView from "@/components/MinDataView";
 
 interface DAGNode {
   taskId: number;
@@ -32,6 +33,7 @@ interface DAGNode {
 interface DAGResp {
   customerId: string;
   customerName: string;
+  custNo: string;
   overallStatus: string;
   customerMinData: Record<string, unknown>;
   nodes: DAGNode[];
@@ -161,7 +163,11 @@ export default function CustomerDetailPage({ params }: { params: { id: string } 
             <ArrowLeft className="h-4 w-4" />
           </Link>
           <div>
-            <div className="font-mono text-xs text-slate-500">{dag.customerId}</div>
+            <div className="flex items-center gap-2 text-xs text-slate-500">
+              <span className="font-mono">{dag.customerId}</span>
+              <span className="text-slate-300">·</span>
+              <span>cust_no: <code className="font-mono text-slate-700">{dag.custNo}</code></span>
+            </div>
             <h1 className="text-xl font-bold">{dag.customerName}</h1>
           </div>
           <StatusBadge status={dag.overallStatus} />
@@ -180,16 +186,7 @@ export default function CustomerDetailPage({ params }: { params: { id: string } 
           <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
             Customer Min Data
           </div>
-          <dl className="space-y-1 text-sm">
-            {Object.entries(dag.customerMinData).map(([k, v]) => (
-              <div key={k} className="flex justify-between gap-2">
-                <dt className="text-slate-500">{k}</dt>
-                <dd className="font-mono text-slate-800">
-                  {v == null || v === "" ? "—" : String(v)}
-                </dd>
-              </div>
-            ))}
-          </dl>
+          <MinDataView minData={dag.customerMinData} />
         </div>
         <div className="card col-span-8 flex flex-col justify-between">
           <div>

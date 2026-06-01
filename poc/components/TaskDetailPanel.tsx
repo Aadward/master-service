@@ -3,6 +3,7 @@
 import { X, RefreshCw, FastForward, AlertCircle } from "lucide-react";
 import StatusBadge from "./StatusBadge";
 import JSONView from "./JSONView";
+import MinDataView from "./MinDataView";
 import { useToast } from "./ToastProvider";
 
 /**
@@ -106,7 +107,7 @@ export default function TaskDetailPanel({
 
         {/* min data */}
         <Section title="Customer Min Data">
-          <JSONView value={task.customerMinData} />
+          <MinDataView minData={task.customerMinData} />
         </Section>
 
         {/* suggested */}

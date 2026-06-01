@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { TaskStatus } from "@/lib/types";
+import { buildCustomerMinData } from "@/lib/customer-shape";
 
 /**
  * GET /api/inbox?domain=<module>&owner=<who>[&recent=<n>]
@@ -35,7 +36,7 @@ export async function GET(req: NextRequest) {
         ],
       },
     },
-    include: { customer: true },
+    include: { customer: { include: { locations: true } } },
     orderBy: [{ readyAt: "desc" }],
   });
 
@@ -45,7 +46,7 @@ export async function GET(req: NextRequest) {
           module: domain,
           status: { in: [TaskStatus.DONE, TaskStatus.SKIPPED] },
         },
-        include: { customer: true },
+        include: { customer: { include: { locations: true } } },
         orderBy: { completedAt: "desc" },
         take: recent,
       })
@@ -57,16 +58,9 @@ export async function GET(req: NextRequest) {
     pageRef: t.pageRef,
     status: t.status,
     customerId: t.customer.customerId,
-    customerName: t.customer.name,
-    customerMinData: {
-      customerId: t.customer.customerId,
-      name: t.customer.name,
-      country: t.customer.country,
-      industry: t.customer.industry,
-      customerType: t.customer.customerType,
-      legalEntity: t.customer.legalEntity,
-      defaultCurrency: t.customer.defaultCurrency,
-    },
+    customerName: t.customer.custName,
+    custNo: t.customer.custNo,
+    customerMinData: buildCustomerMinData(t.customer, t.customer.locations),
     suggestedConfig: t.suggestedConfigSnapshot
       ? JSON.parse(t.suggestedConfigSnapshot)
       : null,

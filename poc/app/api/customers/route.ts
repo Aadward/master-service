@@ -4,26 +4,41 @@ import { z } from "zod";
 import { loadActiveTemplate } from "@/lib/template-engine";
 import { activateInitialTasks } from "@/lib/dag-coordinator";
 import { CustomerStatus, TaskStatus } from "@/lib/types";
-import { loadAllLookups } from "@/lib/lookups";
 import { maybeReplay, recordResponse } from "@/lib/idempotency";
 
 /**
  * POST /api/customers
- *   原子事务：分配 customer_id（Counter 自增）→ 写 customer → 物化任务 → 写 audit
- *   竞态保护：Counter 表的 increment 保证 customer_id 不会重复
+ *   原子事务：分配 customer_id → 写 customer + locations → 物化任务 → 写 audit
  *
  * GET /api/customers
  *   列表
  */
 
+const LocationSchema = z.object({
+  domain: z.string().min(1),
+  locNo: z.string().regex(/^\d+$/, "loc_no must be digits only"),
+});
+
+const DIGITS = /^\d+$/;
+const REGION_OPTIONS = ["10001", "10002", "10006", "10007"] as const;
+
 const CreateCustomerSchema = z.object({
-  externalRef: z.string().optional(),
-  name: z.string().min(1),
-  country: z.string().optional(),
-  industry: z.string().optional(),
-  customerType: z.string().min(1),
-  legalEntity: z.string().optional(),
-  defaultCurrency: z.string().optional(),
+  custNo: z.string().regex(DIGITS, "cust_no must be digits only"),
+  custName: z.string().min(1),
+  globalCustNo: z
+    .string()
+    .regex(DIGITS, "global_cust_no must be digits only")
+    .optional()
+    .nullable(),
+  globalCustName: z.string().optional().nullable(),
+  globalCustCode: z.string().optional().nullable(),
+  regionNo: z.enum(REGION_OPTIONS).optional().nullable(),
+  companyNo: z.string().regex(DIGITS, "company_no must be digits only").optional().nullable(),
+  isMaster: z.boolean().default(false),
+  isInterCompany: z.boolean().default(false),
+  customerType: z.string().default("standard_b2b"),
+  externalRef: z.string().optional().nullable(),
+  locations: z.array(LocationSchema).default([]),
 });
 
 function fmtCustomerId(n: number) {
@@ -31,7 +46,6 @@ function fmtCustomerId(n: number) {
 }
 
 export async function POST(req: NextRequest) {
-  // Idempotency-Key: 如同 key 24h 内已成功执行过，直接回放
   const replay = maybeReplay(req);
   if (replay) return replay;
 
@@ -61,13 +75,20 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 把所有写入放在一个事务里：客户 + 任务 + audit 同时成功或一起回滚
+  // cust_no 唯一性预校验，给出友好错误
+  const existsByCustNo = await db.customer.findUnique({ where: { custNo: input.custNo } });
+  if (existsByCustNo) {
+    return NextResponse.json(
+      { code: "DUPLICATE_CUST_NO", message: `cust_no '${input.custNo}' already exists` },
+      { status: 409 }
+    );
+  }
+
   let customerId = "";
   let taskCount = 0;
   try {
     const result = await db.$transaction(async (tx) => {
-      // 1. 原子自增 customer_id 序号（修 race condition）
-      //    首次创建时 bootstrap 为现有客户数 + 1，避免与历史 ID 冲突
+      // 1. 原子自增内部 customerId 序号（首次创建时按当前数 bootstrap）
       let counterValue: number;
       const existing = await tx.counter.findUnique({ where: { name: "customer_seq" } });
       if (existing) {
@@ -89,20 +110,35 @@ export async function POST(req: NextRequest) {
       await tx.customer.create({
         data: {
           customerId: cid,
+          custNo: input.custNo,
+          custName: input.custName,
+          globalCustNo: input.globalCustNo ?? null,
+          globalCustName: input.globalCustName ?? null,
+          globalCustCode: input.globalCustCode ?? null,
+          regionNo: input.regionNo ?? null,
+          companyNo: input.companyNo ?? null,
+          isMaster: input.isMaster,
+          isInterCompany: input.isInterCompany,
           externalRef: input.externalRef ?? null,
-          name: input.name,
-          country: input.country ?? null,
-          industry: input.industry ?? null,
           customerType: input.customerType,
-          legalEntity: input.legalEntity ?? null,
-          defaultCurrency: input.defaultCurrency ?? null,
           overallStatus: CustomerStatus.INIT,
           templateId: tmpl.templateId,
           templateVersion: tmpl.version,
         },
       });
 
-      // 3. 物化所有任务为 WAITING（createMany 一次写入）
+      // 2b. 写入 locations（如有）
+      if (input.locations.length > 0) {
+        await tx.customerLocation.createMany({
+          data: input.locations.map((l) => ({
+            customerId: cid,
+            domain: l.domain,
+            locNo: l.locNo,
+          })),
+        });
+      }
+
+      // 3. 物化所有任务为 WAITING
       const rows: Array<{
         customerId: string;
         module: string;
@@ -125,14 +161,14 @@ export async function POST(req: NextRequest) {
       }
       await tx.configTask.createMany({ data: rows });
 
-      // 4. customer_create audit
+      // 4. audit
       await tx.auditLog.create({
         data: {
           customerId: cid,
           eventType: "customer_create",
           toStatus: CustomerStatus.INIT,
           actor: "user",
-          reason: `materialized ${rows.length} tasks from ${tmpl.templateId} v${tmpl.version}`,
+          reason: `materialized ${rows.length} tasks from ${tmpl.templateId} v${tmpl.version}, ${input.locations.length} locations`,
         },
       });
 
@@ -148,16 +184,17 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 5. 在事务外做后继激活（避免长事务持锁；activateInitialTasks 自身已事务化）
   const readyTasks = await activateInitialTasks(customerId);
 
   const responseBody = {
     customerId,
+    custNo: input.custNo,
     overallStatus: CustomerStatus.INIT,
     templateId: tmpl.templateId,
     templateVersion: tmpl.version,
     tasksTotal: taskCount,
     tasksReady: readyTasks.length,
+    locationsCount: input.locations.length,
     links: {
       status: `/api/customers/${customerId}/status`,
       dag: `/api/customers/${customerId}/dag`,
@@ -171,7 +208,8 @@ export async function GET() {
   const customers = await db.customer.findMany({
     orderBy: { createdAt: "desc" },
     include: {
-      tasks: { select: { status: true, module: true } },
+      tasks: { select: { status: true } },
+      locations: true,
     },
   });
   const items = customers.map((c) => {
@@ -179,21 +217,21 @@ export async function GET() {
     for (const t of c.tasks) stats[t.status] = (stats[t.status] ?? 0) + 1;
     return {
       customerId: c.customerId,
-      name: c.name,
-      country: c.country,
-      industry: c.industry,
+      custNo: c.custNo,
+      custName: c.custName,
+      globalCustNo: c.globalCustNo,
+      regionNo: c.regionNo,
+      companyNo: c.companyNo,
+      isMaster: c.isMaster,
+      isInterCompany: c.isInterCompany,
       customerType: c.customerType,
       overallStatus: c.overallStatus,
       createdAt: c.createdAt,
       tasksTotal: c.tasks.length,
       tasksDone: (stats["DONE"] ?? 0) + (stats["SKIPPED"] ?? 0),
       tasksFailed: stats["FAILED"] ?? 0,
+      locationsCount: c.locations.length,
     };
   });
-
-  // 同时返回服务端预热的统计，便于客户端轮询时不再额外拉
   return NextResponse.json({ items });
 }
-
-// 让 loadAllLookups 在 GET / POST 之外可被预热（防止 lazy-load 抖动）
-void loadAllLookups; // unused import suppress

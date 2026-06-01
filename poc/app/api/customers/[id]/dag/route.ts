@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { buildCustomerMinData } from "@/lib/customer-shape";
 
 /**
  * GET /api/customers/{id}/dag
@@ -13,6 +14,7 @@ export async function GET(
     where: { customerId: params.id },
     include: {
       tasks: true,
+      locations: true,
     },
   });
   if (!customer) return NextResponse.json({ code: "NOT_FOUND" }, { status: 404 });
@@ -35,7 +37,6 @@ export async function GET(
       : null,
   }));
 
-  // edges：把 depends_on 中的 taskKey 解析为对应的 from→to
   const taskByKey = new Map(customer.tasks.map((t) => [t.taskKey, t.taskId]));
   const edges: Array<{ from: number; to: number; fromKey: string; toKey: string }> = [];
   for (const t of customer.tasks) {
@@ -50,17 +51,10 @@ export async function GET(
 
   return NextResponse.json({
     customerId: customer.customerId,
-    customerName: customer.name,
+    customerName: customer.custName, // 保留旧字段名供前端兼容
+    custNo: customer.custNo,
     overallStatus: customer.overallStatus,
-    customerMinData: {
-      customerId: customer.customerId,
-      name: customer.name,
-      country: customer.country,
-      industry: customer.industry,
-      customerType: customer.customerType,
-      legalEntity: customer.legalEntity,
-      defaultCurrency: customer.defaultCurrency,
-    },
+    customerMinData: buildCustomerMinData(customer, customer.locations),
     nodes,
     edges,
   });

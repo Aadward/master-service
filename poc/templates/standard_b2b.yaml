@@ -1,7 +1,8 @@
 customer_type: standard_b2b
 version: 1
-description: "标准 B2B 客户配置模板"
+description: "标准 B2B 客户配置模板（基于 cust_no 等最小集合 + 一对多 location）"
 modules:
+  # ─────────────────────────── SALES ───────────────────────────
   sales:
     tasks:
       - task_key: sales.customer_profile
@@ -9,33 +10,65 @@ modules:
         required: true
         depends_on: []
         suggestions:
-          currency: "${lookup.currency_by_country[customer.country]}"
-          tax_region: "${customer.country}"
-          payment_terms: "NET30"
+          currency:           "${lookup.currency_by_region[customer.regionNo]}"
+          tax_region:         "${customer.regionNo}"
+          payment_terms:      "NET30"
+          sales_team:         "${lookup.sales_team_by_region[customer.regionNo]}"
+          customer_category:  "${customer.isMaster == true ? 'MASTER_ACCOUNT' : 'REGULAR'}"
+          intercompany_flag:  "${customer.isInterCompany == true ? 'YES' : 'NO'}"
+          default_sales_loc:  "${customer.sales_loc_no}"
+
       - task_key: sales.shipping_address
         page_ref: Sales-Page-02
         required: true
         depends_on:
           - sales.customer_profile
+        suggestions:
+          default_shipping_loc: "${customer.sales_loc_no}"
+          default_warehouse:    "${customer.mfg_loc_no}"
+          delivery_term:        "${customer.isInterCompany == true ? 'FCA' : 'CIF'}"
+          shipping_priority:    "${customer.isMaster == true ? 'EXPEDITED' : 'STANDARD'}"
+          consolidation_allowed: true
+
       - task_key: sales.price_list
         page_ref: Sales-Page-03
         required: true
         depends_on:
           - sales.customer_profile
         suggestions:
-          price_book: "${customer.customerType}_${customer.country}"
-          currency: "${lookup.currency_by_country[customer.country]}"
+          price_book:               "${customer.regionNo}_${customer.companyNo}"
+          currency:                 "${lookup.currency_by_region[customer.regionNo]}"
+          discount_tier:            "${customer.isMaster == true ? 'PLATINUM' : 'STANDARD'}"
+          interco_discount_rate:    "${customer.isInterCompany == true ? 'COST_PLUS_5' : 'NONE'}"
+          rounding_rule:            "HALF_UP"
+          allow_override:           "${customer.isMaster == true ? 'YES' : 'NO'}"
+
+  # ──────────────────────────── CRM ────────────────────────────
   crm:
     tasks:
       - task_key: crm.contact_info
         page_ref: CRM-Page-01
         required: true
         depends_on: []
+        suggestions:
+          preferred_language: "${lookup.language_by_region[customer.regionNo]}"
+          timezone:           "${lookup.timezone_by_region[customer.regionNo]}"
+          primary_channel:    "EMAIL"
+          account_priority:   "${customer.isMaster == true ? 'P1' : 'P3'}"
+
       - task_key: crm.communication_pref
         page_ref: CRM-Page-02
         required: false
         depends_on:
           - crm.contact_info
+        suggestions:
+          language:           "${lookup.language_by_region[customer.regionNo]}"
+          email_frequency:    "${customer.isMaster == true ? 'DAILY' : 'WEEKLY'}"
+          newsletter_opt_in:  "${customer.isInterCompany == true ? 'NO' : 'YES'}"
+          marketing_opt_in:   "${customer.isInterCompany == true ? 'NO' : 'YES'}"
+          do_not_call_window: "${lookup.timezone_by_region[customer.regionNo]}"
+
+  # ────────────────────────── FINANCE ──────────────────────────
   finance:
     tasks:
       - task_key: finance.credit_limit
@@ -44,15 +77,24 @@ modules:
         depends_on:
           - sales.customer_profile
         suggestions:
-          initial_limit: "${customer.industry == 'Auto' ? 100000 : 50000}"
-          review_cycle_days: 90
+          currency:               "${lookup.currency_by_region[customer.regionNo]}"
+          initial_limit:          "${customer.isMaster == true ? 500000 : 100000}"
+          review_cycle_days:      90
+          credit_check_required:  "${customer.isInterCompany == true ? 'NO' : 'YES'}"
+          approval_level:         "${customer.isMaster == true ? 'CFO' : 'FINANCE_MANAGER'}"
+
       - task_key: finance.payment_terms
         page_ref: Finance-Page-02
         required: true
         depends_on:
           - sales.customer_profile
         suggestions:
-          terms: "NET30"
+          terms:                          "NET30"
+          currency:                       "${lookup.currency_by_region[customer.regionNo]}"
+          early_payment_discount_pct:     "${customer.isMaster == true ? 2 : 0}"
+          late_payment_penalty_pct:       1.5
+          requires_inter_company_terms:   "${customer.isInterCompany == true ? 'YES' : 'NO'}"
+
       - task_key: finance.tax_setup
         page_ref: Finance-Page-03
         required: true
@@ -60,7 +102,13 @@ modules:
           - finance.credit_limit
           - crm.contact_info
         suggestions:
-          tax_region: "${customer.country}"
+          tax_region:               "${customer.regionNo}"
+          vat_applicable:           "${customer.regionNo == '10002' ? 'YES' : 'NO'}"
+          tax_id_required:          "${customer.isInterCompany == true ? 'NO' : 'YES'}"
+          withholding_tax_required: "${customer.isInterCompany == true ? 'YES' : 'NO'}"
+          tax_invoice_language:     "${lookup.language_by_region[customer.regionNo]}"
+
+  # ──────────────────────────── MRP ────────────────────────────
   mrp:
     tasks:
       - task_key: mrp.demand_planning
@@ -70,13 +118,25 @@ modules:
           - sales.price_list
           - finance.credit_limit
         suggestions:
-          horizon_days: "${customer.industry == 'Auto' ? 180 : 90}"
-          safety_stock_pct: "${customer.industry == 'Auto' ? 15 : 5}"
+          horizon_days:           "${customer.isInterCompany == true ? 180 : 90}"
+          safety_stock_pct:       "${customer.isInterCompany == true ? 20 : 10}"
+          planning_method:        "${customer.isMaster == true ? 'MTO' : 'MTS'}"
+          review_frequency_weeks: 2
+          default_mfg_loc:        "${customer.mfg_loc_no}"
+
       - task_key: mrp.supplier_link
         page_ref: MRP-Page-02
         required: false
         depends_on:
           - mrp.demand_planning
+        suggestions:
+          default_supplier_loc:   "${customer.mfg_loc_no}"
+          supplier_tier:          "${customer.isMaster == true ? 'TIER1' : 'TIER2'}"
+          po_auto_release:        "${customer.isInterCompany == true ? 'YES' : 'NO'}"
+          po_currency:            "${lookup.currency_by_region[customer.regionNo]}"
+          lead_time_buffer_days:  "${customer.isInterCompany == true ? 7 : 3}"
+
+  # ──────────────────────────── PLM ────────────────────────────
   plm:
     tasks:
       - task_key: plm.bom_visibility
@@ -84,9 +144,22 @@ modules:
         required: true
         depends_on:
           - mrp.demand_planning
+        suggestions:
+          visible_at_loc:           "${customer.plm_loc_no}"
+          bom_view_level:           "${customer.isInterCompany == true ? 'FULL' : 'SUMMARY'}"
+          design_change_notify:     "${customer.isMaster == true ? 'YES' : 'NO'}"
+          revision_history_visible: "LAST_5"
+          cost_visibility:          "${customer.isInterCompany == true ? 'YES' : 'NO'}"
+
       - task_key: plm.product_catalog
         page_ref: PLM-Page-02
         required: true
         depends_on:
           - plm.bom_visibility
           - sales.price_list
+        suggestions:
+          default_catalog_region:  "${customer.regionNo}"
+          catalog_view_level:      "${customer.isMaster == true ? 'FULL' : 'STANDARD'}"
+          catalog_language:        "${lookup.language_by_region[customer.regionNo]}"
+          price_visible_in_catalog: "${customer.isInterCompany == true ? 'YES' : 'NO'}"
+          new_product_notify:      "${customer.isMaster == true ? 'YES' : 'NO'}"

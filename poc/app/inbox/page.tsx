@@ -18,6 +18,7 @@ import {
 import { usePolling } from "@/lib/usePolling";
 import { useDebouncedValue } from "@/lib/useDebouncedValue";
 import StatusBadge from "@/components/StatusBadge";
+import MinDataView from "@/components/MinDataView";
 import { useToast } from "@/components/ToastProvider";
 
 const DEFAULT_DOMAINS = ["sales", "crm", "finance", "mrp", "plm"];
@@ -369,16 +370,9 @@ function PendingCard({
             <MapPin className="h-3.5 w-3.5" />
             Customer Info（最小集合，供你参考）
           </SubHeader>
-          <dl className="mt-2 space-y-1 text-sm">
-            {Object.entries(task.customerMinData)
-              .filter(([, v]) => v !== null && v !== "")
-              .map(([k, v]) => (
-                <div key={k} className="flex justify-between gap-2">
-                  <dt className="text-slate-500">{k}</dt>
-                  <dd className="font-mono text-slate-800">{String(v)}</dd>
-                </div>
-              ))}
-          </dl>
+          <div className="mt-2">
+            <MinDataView minData={task.customerMinData} />
+          </div>
         </div>
 
         {/* Configuration guidance */}
