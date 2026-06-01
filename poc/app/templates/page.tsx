@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import yaml from "js-yaml";
 import {
   ReactFlow,
   Background,
@@ -10,8 +11,10 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import dagre from "dagre";
+import { Plus, Pencil } from "lucide-react";
 import TaskNode from "@/components/TaskNode";
 import JSONView from "@/components/JSONView";
+import TemplateEditor from "@/components/TemplateEditor";
 
 interface TemplateDef {
   customer_type: string;
@@ -50,8 +53,9 @@ function layout(nodes: Node[], edges: Edge[]) {
 export default function TemplatesPage() {
   const [templates, setTemplates] = useState<TemplateDef[]>([]);
   const [active, setActive] = useState<TemplateDef | null>(null);
+  const [editing, setEditing] = useState<{ kind: "new" | "edit"; yaml?: string } | null>(null);
 
-  useEffect(() => {
+  const refresh = useCallback(() => {
     fetch("/api/templates")
       .then((r) => r.json())
       .then((j) => {
@@ -59,26 +63,31 @@ export default function TemplatesPage() {
           (it: { definition: TemplateDef }) => it.definition
         );
         setTemplates(defs);
-        if (defs[0]) setActive(defs[0]);
+        // 保持选中：尽量选回原 customer_type，否则选第一个
+        setActive((prev) => {
+          if (!prev) return defs[0] ?? null;
+          const match = defs.find((d: TemplateDef) => d.customer_type === prev.customer_type);
+          return match ?? defs[0] ?? null;
+        });
       });
   }, []);
 
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
   const { nodes, edges } = useMemo(() => {
     if (!active) return { nodes: [], edges: [] };
-    const allTasks: Array<{ key: string; module: string; deps: string[]; sugg?: Record<string, unknown> }> = [];
+    const allTasks: Array<{ key: string; module: string; deps: string[] }> = [];
     for (const [m, mod] of Object.entries(active.modules)) {
       for (const t of mod.tasks) {
-        allTasks.push({ key: t.task_key, module: m, deps: t.depends_on ?? [], sugg: t.suggestions });
+        allTasks.push({ key: t.task_key, module: m, deps: t.depends_on ?? [] });
       }
     }
     const rawNodes: Node[] = allTasks.map((t) => ({
       id: t.key,
       type: "task",
-      data: {
-        taskKey: t.key,
-        module: t.module,
-        status: "WAITING",
-      },
+      data: { taskKey: t.key, module: t.module, status: "WAITING" },
       position: { x: 0, y: 0 },
     }));
     const rawEdges: Edge[] = [];
@@ -97,46 +106,93 @@ export default function TemplatesPage() {
 
   return (
     <div className="space-y-4">
-      <header>
-        <h1 className="text-2xl font-bold">Templates</h1>
-        <p className="mt-1 text-sm text-slate-500">
-          只读：当前 active 的模板及其 DAG 结构。模板版本化、可灰度，但 POC 仅展示当前版本。
-        </p>
+      <header className="flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">Templates</h1>
+          <p className="mt-1 text-sm text-slate-500">
+            管理客户配置模板。一个 customer_type 可以有多个版本；激活版本即"当前"。
+          </p>
+        </div>
+        <button
+          className="btn btn-primary"
+          onClick={() => setEditing({ kind: "new" })}
+        >
+          <Plus className="h-4 w-4" />
+          New Template
+        </button>
       </header>
 
+      {/* 模板 tabs */}
       <section className="flex flex-wrap gap-2">
-        {templates.map((t) => (
-          <button
-            key={t.customer_type}
-            onClick={() => setActive(t)}
-            className={`btn ${active?.customer_type === t.customer_type ? "btn-primary" : ""}`}
-          >
-            {t.customer_type} <span className="ml-1 text-xs opacity-70">v{t.version}</span>
-          </button>
-        ))}
+        {templates.length === 0 ? (
+          <div className="rounded-md border border-dashed border-slate-200 px-3 py-3 text-xs text-slate-400">
+            尚无激活的模板。点 "New Template" 创建一个。
+          </div>
+        ) : (
+          templates.map((t) => (
+            <button
+              key={t.customer_type}
+              onClick={() => setActive(t)}
+              className={`btn ${active?.customer_type === t.customer_type ? "btn-primary" : ""}`}
+            >
+              {t.customer_type} <span className="ml-1 text-xs opacity-70">v{t.version}</span>
+            </button>
+          ))
+        )}
       </section>
 
-      {active && (
+      {/* 编辑器（打开时显示） */}
+      {editing && (
+        <TemplateEditor
+          title={editing.kind === "new" ? "Create New Template" : `Edit ${active?.customer_type}`}
+          initialYaml={editing.yaml}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null);
+            refresh();
+          }}
+        />
+      )}
+
+      {active && !editing && (
         <>
-          <section className="card">
-            <div className="flex items-center justify-between">
+          <section className="card flex items-center justify-between">
+            <div className="flex gap-6">
               <div>
                 <div className="text-[10px] uppercase tracking-wider text-slate-500">
                   customer_type
                 </div>
                 <div className="font-mono text-lg">{active.customer_type}</div>
               </div>
-              <div className="text-right">
+              <div>
                 <div className="text-[10px] uppercase tracking-wider text-slate-500">
                   version
                 </div>
                 <div className="font-mono text-lg">v{active.version}</div>
               </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-slate-500">
+                  tasks
+                </div>
+                <div className="font-mono text-lg">
+                  {Object.values(active.modules).reduce(
+                    (acc, m) => acc + m.tasks.length, 0
+                  )}
+                </div>
+              </div>
             </div>
-            {active.description && (
-              <p className="mt-2 text-sm text-slate-600">{active.description}</p>
-            )}
+            <button
+              className="btn"
+              onClick={() => setEditing({ kind: "edit", yaml: yaml.dump(active) })}
+            >
+              <Pencil className="h-4 w-4" />
+              Edit
+            </button>
           </section>
+
+          {active.description && (
+            <p className="text-sm text-slate-600">{active.description}</p>
+          )}
 
           <section className="card overflow-hidden p-0">
             <div className="border-b border-slate-100 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
