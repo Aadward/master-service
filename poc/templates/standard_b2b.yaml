@@ -1,0 +1,92 @@
+customer_type: standard_b2b
+version: 1
+description: "标准 B2B 客户配置模板"
+modules:
+  sales:
+    tasks:
+      - task_key: sales.customer_profile
+        page_ref: Sales-Page-01
+        required: true
+        depends_on: []
+        suggestions:
+          currency: "${lookup.currency_by_country[customer.country]}"
+          tax_region: "${customer.country}"
+          payment_terms: "NET30"
+      - task_key: sales.shipping_address
+        page_ref: Sales-Page-02
+        required: true
+        depends_on:
+          - sales.customer_profile
+      - task_key: sales.price_list
+        page_ref: Sales-Page-03
+        required: true
+        depends_on:
+          - sales.customer_profile
+        suggestions:
+          price_book: "${customer.customerType}_${customer.country}"
+          currency: "${lookup.currency_by_country[customer.country]}"
+  crm:
+    tasks:
+      - task_key: crm.contact_info
+        page_ref: CRM-Page-01
+        required: true
+        depends_on: []
+      - task_key: crm.communication_pref
+        page_ref: CRM-Page-02
+        required: false
+        depends_on:
+          - crm.contact_info
+  finance:
+    tasks:
+      - task_key: finance.credit_limit
+        page_ref: Finance-Page-01
+        required: true
+        depends_on:
+          - sales.customer_profile
+        suggestions:
+          initial_limit: "${customer.industry == 'Auto' ? 100000 : 50000}"
+          review_cycle_days: 90
+      - task_key: finance.payment_terms
+        page_ref: Finance-Page-02
+        required: true
+        depends_on:
+          - sales.customer_profile
+        suggestions:
+          terms: "NET30"
+      - task_key: finance.tax_setup
+        page_ref: Finance-Page-03
+        required: true
+        depends_on:
+          - finance.credit_limit
+          - crm.contact_info
+        suggestions:
+          tax_region: "${customer.country}"
+  mrp:
+    tasks:
+      - task_key: mrp.demand_planning
+        page_ref: MRP-Page-01
+        required: true
+        depends_on:
+          - sales.price_list
+          - finance.credit_limit
+        suggestions:
+          horizon_days: "${customer.industry == 'Auto' ? 180 : 90}"
+          safety_stock_pct: "${customer.industry == 'Auto' ? 15 : 5}"
+      - task_key: mrp.supplier_link
+        page_ref: MRP-Page-02
+        required: false
+        depends_on:
+          - mrp.demand_planning
+  plm:
+    tasks:
+      - task_key: plm.bom_visibility
+        page_ref: PLM-Page-01
+        required: true
+        depends_on:
+          - mrp.demand_planning
+      - task_key: plm.product_catalog
+        page_ref: PLM-Page-02
+        required: true
+        depends_on:
+          - plm.bom_visibility
+          - sales.price_list

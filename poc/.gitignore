@@ -1,0 +1,30 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# next
+.next/
+out/
+build/
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# env
+.env*.local
+
+# prisma
+prisma/dev.db
+prisma/dev.db-journal
+prisma/migrations/dev/
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts.bak
