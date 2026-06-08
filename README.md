@@ -33,6 +33,8 @@
 | [06-api-contract.md](docs/06-api-contract.md) | 对外 REST 接口契约 |
 | [07-pitfalls-and-invariants.md](docs/07-pitfalls-and-invariants.md) | 易踩坑点与边界守护 |
 | [08-roadmap.md](docs/08-roadmap.md) | 演进路径建议 |
+| [09-attribute-versioning.md](docs/09-attribute-versioning.md) | 通用属性版本化（多聚合根 / 时点回溯 / 多值 attribute） |
+| [10-creation-guide.md](docs/10-creation-guide.md) | 人工配置向导（DAG + Checkpoint SQL）— 异构子系统场景的编排层 |
 
 ## 当前状态
 
