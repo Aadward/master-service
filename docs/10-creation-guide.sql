@@ -237,7 +237,9 @@ INSERT INTO guide_node_status (guide_instance_id, node_key, status) VALUES
     (@guide_inst_id, 'crm.marketing_segment',      'WAITING'),
     (@guide_inst_id, 'audit.signoff',              'WAITING');
 
--- 步骤 4: 入度=0 的节点 (无 depends_on) 置为 READY
+-- 步骤 4: 入度=0 的节点 (无 depends_on 或 depends_on 字段缺失) 置为 READY
+-- 注意: depends_on 字段缺失时, JSON_TABLE 抽出来的是 NULL, JSON_LENGTH(NULL) = NULL, NULL = 0 是 false
+-- 必须显式 IS NULL 兜底, 否则会漏置根节点为 READY
 UPDATE guide_node_status
 SET status = 'READY', ready_at = NOW(3)
 WHERE guide_instance_id = @guide_inst_id
@@ -250,7 +252,7 @@ WHERE guide_instance_id = @guide_inst_id
       COLUMNS (node_key VARCHAR(100) PATH '$.key',
                depends_on JSON PATH '$.depends_on')
     ) AS n
-    WHERE JSON_LENGTH(n.depends_on) = 0
+    WHERE n.depends_on IS NULL OR JSON_LENGTH(n.depends_on) = 0
   );
 -- 这里只有 sales.account_creation 会变 READY
 
@@ -258,6 +260,10 @@ COMMIT;
 
 
 -- 5.5 推进 DAG: 节点 sales.account_creation DONE 后 -----------------
+
+-- 参数化变量: 实际系统中应通过存储过程或应用层绑定, 这里用 @just_done_node_key 占位
+SET @just_done_node_key = 'sales.account_creation';
+SET @guide_inst_id = 8801;  -- 假设
 
 START TRANSACTION;
 
@@ -277,11 +283,14 @@ SET status = 'DONE',
         )
     )
 WHERE guide_instance_id = @guide_inst_id
-  AND node_key = 'sales.account_creation'
+  AND node_key = @just_done_node_key
   AND status = 'READY';
 
--- 推进后继: 从 definition_snapshot 找所有 depends_on 包含 sales.account_creation 的节点
--- 若其所有依赖都已终态, 置为 READY
+-- 推进后继: 从 definition_snapshot 找所有 depends_on 包含刚 DONE 节点的节点
+-- 推进规则: 子节点的所有 deps 都处于 DONE 或 SKIPPED 时, 才推进到 READY
+--   - dep=READY (在工作中) -> 子节点仍 WAITING, 等 dep 完成
+--   - dep=FAILED -> 子节点仍 WAITING (FAILED 不推进后继)
+--   - dep=BLOCKED -> 子节点仍 WAITING (需先 unblock)
 UPDATE guide_node_status child
 JOIN creation_guide_instance i
   ON i.guide_instance_id = child.guide_instance_id
@@ -295,7 +304,7 @@ JOIN JSON_TABLE(
 SET child.status = 'READY', child.ready_at = NOW(3)
 WHERE child.guide_instance_id = @guide_inst_id
   AND child.status = 'WAITING'
-  AND JSON_CONTAINS(def.depends_on, JSON_QUOTE('sales.account_creation'))
+  AND JSON_CONTAINS(def.depends_on, JSON_QUOTE(@just_done_node_key))
   AND NOT EXISTS (
     SELECT 1
     FROM JSON_TABLE(def.depends_on, '$[*]' COLUMNS (dep VARCHAR(100) PATH '$')) AS d
@@ -307,13 +316,19 @@ WHERE child.guide_instance_id = @guide_inst_id
 -- 这里 sales.contact_sync 和 finance.tax_region_setup 会变 READY
 
 -- 重新聚合 overall_status
+-- 优先级: PARTIAL > READY > INIT > IN_PROGRESS
+-- CANCELLED 不通过此 SQL 派生, 由 POST /guides/{id}/cancel 单独路径写入
 UPDATE creation_guide_instance
 SET overall_status = (
     SELECT CASE
-        WHEN SUM(status NOT IN ('DONE','SKIPPED','BLOCKED','FAILED')) > 0 THEN 'IN_PROGRESS'
+        -- 1. 任何 FAILED/BLOCKED -> PARTIAL (最高优先级)
         WHEN SUM(status IN ('FAILED','BLOCKED')) > 0 THEN 'PARTIAL'
+        -- 2. 全部节点都是 DONE/SKIPPED (无 WAITING/READY) -> READY
+        WHEN SUM(status NOT IN ('DONE','SKIPPED')) = 0 THEN 'READY'
+        -- 3. 全部节点都还在 WAITING (未被任何 advance 推过) -> INIT
         WHEN SUM(status = 'WAITING') = COUNT(*) THEN 'INIT'
-        ELSE 'READY'
+        -- 4. 其余 (有 READY, 或 WAITING+READY 混合) -> IN_PROGRESS
+        ELSE 'IN_PROGRESS'
     END
     FROM guide_node_status
     WHERE guide_instance_id = @guide_inst_id
@@ -364,29 +379,138 @@ COMMIT;
 
 -- 5.8 Block / Unblock ---------------------------------------------
 
--- Block (任意非终态 -> BLOCKED, 不推进后继)
+-- Block (仅限非终态: WAITING/READY -> BLOCKED; 终态不可再 Block)
+-- 终态 (DONE/SKIPPED/FAILED/BLOCKED) 不允许转入 BLOCKED, 是 "已锁死" 的状态
 UPDATE guide_node_status
 SET status = 'BLOCKED'
 WHERE guide_instance_id = @guide_inst_id
   AND node_key = 'mrp.demand_planning'
   AND status IN ('READY', 'WAITING');
 
--- Unblock: 强制回 WAITING, 重新评估依赖
+-- Unblock: 强制回 WAITING, 触发**两段** advance_dag
+-- 段 1: 评本节点: deps 全 DONE/SKIPPED 则 WAITING -> READY
+-- 段 2: 评子节点: 依据本节点新状态 + 兄弟节点状态
+-- 两段必须在**同一事务**内, 否则 unblock 后的中间态会被外部观察到
+START TRANSACTION;
+
+-- 段 1: 本节点先回 WAITING
 UPDATE guide_node_status
 SET status = 'WAITING'
 WHERE guide_instance_id = @guide_inst_id
   AND node_key = 'mrp.demand_planning'
   AND status = 'BLOCKED';
--- 之后: 走 advance_dag 流程, 若依赖已终态则 WAITING -> READY
+
+-- 段 1 (续): 立刻按 advance_dag 规则推进本节点
+-- 若本节点的所有 deps 都已 DONE/SKIPPED, 则 WAITING -> READY
+UPDATE guide_node_status self
+JOIN creation_guide_instance i
+  ON i.guide_instance_id = self.guide_instance_id
+JOIN JSON_TABLE(
+  i.definition_snapshot, '$.nodes[*]'
+  COLUMNS (
+    node_key VARCHAR(100) PATH '$.key',
+    depends_on JSON PATH '$.depends_on'
+  )
+) AS def ON def.node_key = self.node_key
+SET self.status = 'READY', self.ready_at = NOW(3)
+WHERE self.guide_instance_id = @guide_inst_id
+  AND self.node_key = 'mrp.demand_planning'
+  AND self.status = 'WAITING'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM JSON_TABLE(def.depends_on, '$[*]' COLUMNS (dep VARCHAR(100) PATH '$')) AS d
+    JOIN guide_node_status dep_node
+      ON dep_node.guide_instance_id = @guide_inst_id
+     AND dep_node.node_key = d.dep
+    WHERE dep_node.status NOT IN ('DONE', 'SKIPPED')
+  );
+
+-- 段 2: 评子节点 (即 depends_on 包含 mrp.demand_planning 的所有节点)
+-- 复用 §5.5 的 advance_dag 逻辑
+UPDATE guide_node_status child
+JOIN creation_guide_instance i
+  ON i.guide_instance_id = child.guide_instance_id
+JOIN JSON_TABLE(
+  i.definition_snapshot, '$.nodes[*]'
+  COLUMNS (
+    node_key VARCHAR(100) PATH '$.key',
+    depends_on JSON PATH '$.depends_on'
+  )
+) AS def ON def.node_key = child.node_key
+SET child.status = 'READY', child.ready_at = NOW(3)
+WHERE child.guide_instance_id = @guide_inst_id
+  AND child.status = 'WAITING'
+  AND JSON_CONTAINS(def.depends_on, JSON_QUOTE('mrp.demand_planning'))
+  AND NOT EXISTS (
+    SELECT 1
+    FROM JSON_TABLE(def.depends_on, '$[*]' COLUMNS (dep VARCHAR(100) PATH '$')) AS d
+    JOIN guide_node_status dep_node
+      ON dep_node.guide_instance_id = @guide_inst_id
+     AND dep_node.node_key = d.dep
+    WHERE dep_node.status NOT IN ('DONE', 'SKIPPED')
+  );
+
+-- 重新聚合 overall_status (同 §5.5 的 SQL)
+UPDATE creation_guide_instance
+SET overall_status = (
+    SELECT CASE
+        WHEN SUM(status IN ('FAILED','BLOCKED')) > 0 THEN 'PARTIAL'
+        WHEN SUM(status NOT IN ('DONE','SKIPPED')) = 0 THEN 'READY'
+        WHEN SUM(status = 'WAITING') = COUNT(*) THEN 'INIT'
+        ELSE 'IN_PROGRESS'
+    END
+    FROM guide_node_status
+    WHERE guide_instance_id = @guide_inst_id
+)
+WHERE guide_instance_id = @guide_inst_id;
+
+COMMIT;
 
 
 -- 5.9 Retry (FAILED -> READY) --------------------------------------
 
+-- Retry 后本节点回到 READY, 触发整体 advance_dag 重新评估
+-- 但按 §7 / §5.5 的子节点推进规则: 子节点的 deps=READY (不是 DONE/SKIPPED), 子节点**仍 WAITING**
+-- retry 仅恢复 "重做" 能力, 不推进 DAG
+-- (advance_dag SQL 与 §5.5 一致, 这里省略; 整体聚合同 §5.5)
+START TRANSACTION;
+
 UPDATE guide_node_status
-SET status = 'READY'
+SET status = 'READY',
+    ready_at = NOW(3)              -- 重置 ready 时间, 表示重新可领取
 WHERE guide_instance_id = @guide_inst_id
   AND node_key = 'mrp.demand_planning'
   AND status = 'FAILED';
+
+-- 重新聚合 overall_status (注意: 此时 dep=READY, 子节点仍未推进; 整体可能仍为 PARTIAL)
+UPDATE creation_guide_instance
+SET overall_status = (
+    SELECT CASE
+        WHEN SUM(status IN ('FAILED','BLOCKED')) > 0 THEN 'PARTIAL'
+        WHEN SUM(status NOT IN ('DONE','SKIPPED')) = 0 THEN 'READY'
+        WHEN SUM(status = 'WAITING') = COUNT(*) THEN 'INIT'
+        ELSE 'IN_PROGRESS'
+    END
+    FROM guide_node_status
+    WHERE guide_instance_id = @guide_inst_id
+)
+WHERE guide_instance_id = @guide_inst_id;
+
+COMMIT;
+
+
+-- 5.10 Cancel (instance 级) ----------------------------------------
+-- 显式取消整个向导; 与节点状态正交, 直接写 overall_status='CANCELLED'
+-- 不允许再修改节点状态 (除已 FAILED 的可 retry); 实际由应用层 API 校验
+
+UPDATE creation_guide_instance
+SET overall_status = 'CANCELLED',
+    completed_at = NOW(3)
+WHERE guide_instance_id = @guide_inst_id
+  AND overall_status <> 'CANCELLED';        -- 幂等: 重复 cancel 不报错
+
+-- 取消后不允许再 advance_dag (避免污染 CANCELLED 状态)
+-- 取消后节点的 status 保持原状 (WAITING/READY/DONE/...), 便于审计 "取消时还差哪些没做"
 
 
 -- 5.10 查询某 customer 的整体进度 -----------------------------------

@@ -260,7 +260,7 @@ INSERT INTO checkpoint_def VALUES
 | `:<column_name>` | 业务对象表的所有列 | `customer.*` / `location.*` |
 | `:attr_<attr_key>` | 当前属性值 | `attr_value_current`（按 09） |
 
-**返回协议**（至多 1 行）：
+**返回协议**（**至多 1 行**；超过 1 行视为 SQL 编写错误，归一为 `result_status='ERROR'`，`error_code='INVALID_RESULT'`）：
 
 | 列 | 必需 | 取值 |
 |---|---|---|
@@ -376,7 +376,8 @@ guide_node_status                 (per 节点; status / 完成时间 / 最新 ch
 | `guide_node_status` | UNIQUE `(guide_instance_id, node_key)` | 实例内节点不重 |
 | `checkpoint_def` | PK `(root_type, checkpoint_key)` | 类型内 checkpoint key 唯一 |
 
-> 节点 key 在实例内唯一 —— 这条**不**在 DB 层做，由 **应用层** 在实例化时校验。
+> 节点 key 在实例内唯一 —— **DB 层有 `uk_guide_node` UNIQUE 约束兜底**（重复 INSERT 报 1062），
+> 应用层在实例化时预校验（fail fast、错误消息更友好）。
 > Checkpoint key 在 `checkpoint_def` 内由 DB PK 守护。
 
 ### 6.3 与其他表的关系
@@ -384,6 +385,7 @@ guide_node_status                 (per 节点; status / 完成时间 / 最新 ch
 | 引用 | 说明 |
 |---|---|
 | `creation_guide_instance.root_id → customer.cust_no` | **不强制 FK**——`root_type` 多态 |
+| `creation_guide_instance.(template_id, template_version) → creation_guide_template` | **不强制 FK**——实例已通过 `definition_snapshot` 冻结，模板即使改版/废弃也不影响已物化向导；FK 反而会让"老模板不能删"。应用层在实例化时校验模板存在 |
 | 现有 `audit_log` 表（05） | **不复用**——完成信息在 `guide_node_status` 自己 |
 | `attr_value_current`（09） | **强依赖**——`:attr_<key>` 占位符从这里读 |
 | 模板节点的 `checkpoints` 数组 → `checkpoint_def` | **不强制 FK**——允许前向引用，运行期查不到再 ERROR |
@@ -401,7 +403,7 @@ guide_node_status                 (per 节点; status / 完成时间 / 最新 ch
    ┌──────────────────┐
    │     WAITING      │  依赖未满足；不出现在 UI 的"可领取"区
    └────────┬─────────┘
-            │ 所有 depends_on 进入终态
+            │ 所有 depends_on 进入终态 (DONE / SKIPPED)
             ▼
    ┌──────────────────┐
    │      READY       │  `default_owner` 可以开始（"领取"是隐式的——人坐过去就开干）
@@ -417,24 +419,51 @@ guide_node_status                 (per 节点; status / 完成时间 / 最新 ch
           [retry]                       [unblock]
              │                              │
              ▼                              ▼
-          READY                          WAITING  (重评估)
+          READY                          WAITING  (重评估 advance_dag)
+          (触发 advance_dag:             (触发 advance_dag:
+           子节点 deps                    本节点 deps 已满足则
+           =DONE/SKIPPED                  WAITING→READY, 再评子节点)
+           时可推进)
 ```
 
-整体（`creation_guide_instance.overall_status`）的聚合规则：
+**子节点推进规则**（advance_dag 的核心）：子节点只在 `dep` 处于**终态且成功**（`DONE` / `SKIPPED`）时才被推进到 `READY`。
+- `dep = READY`（在工作中）→ 子节点**仍 WAITING**，等 dep 完成
+- `dep = FAILED` → 子节点**仍 WAITING**（FAILED 不推进后继）
+- `dep = BLOCKED` → 子节点**仍 WAITING**（需 dep 先 unblock 并 re-eval）
+- `dep = DONE / SKIPPED` → 子节点可推进
 
-| 节点集合 | overall_status |
-|---|---|
-| 全部 WAITING | `INIT` |
-| 至少一个非终态，且无 FAILED/BLOCKED | `IN_PROGRESS` |
-| 全部 DONE / SKIPPED | `READY` |
-| 存在 FAILED 或 BLOCKED | `PARTIAL` |
-| 显式取消 | `CANCELLED` |
+**retry 之后**（FAILED → READY）：retry 动作自身触发 advance_dag，但因 dep 此时是 READY（不是 DONE/SKIPPED），
+子节点**仍 WAITING**——语义上 retry 让 dep "可以再做一次"，子节点须等 dep 真正完成才推进。这是有意为之，
+避免"retry 中"被误以为是"retry 成功"。
+
+**unblock 之后**（BLOCKED → WAITING）：unblock 触发两段 advance_dag——
+1. 先评本节点：所有 deps 都 DONE/SKIPPED 则 WAITING → READY
+2. 再评子节点：依据本节点的新状态 + 兄弟节点状态做一轮常规 advance
+
+整体（`creation_guide_instance.overall_status`）的聚合规则（**优先级顺序**）：
+
+| 优先级 | 节点集合 | overall_status |
+|---|---|---|
+| 1（最高） | 显式取消 | `CANCELLED` |
+| 2 | 存在 FAILED 或 BLOCKED | `PARTIAL` |
+| 3 | 全部 DONE / SKIPPED（无 WAITING / READY） | `READY` |
+| 4 | 全部节点都还在 WAITING（未被任何 advance 推过） | `INIT` |
+| 5 | 其余（有 READY，或 WAITING + READY 混合） | `IN_PROGRESS` |
+
+> **`CANCELLED` 不通过聚合派生**：是 instance 级别的**显式动作**（`POST /guides/{id}/cancel`）写入，
+> 与节点状态无关。`update_overall_status` 派生逻辑只覆盖 2-5 档；Cancel 是单独路径。
+>
+> **`READY`（节点级）≠ `READY`（instance 整体）**：节点 READY = "可领取"；instance READY = "全部节点都 DONE/SKIPPED"。
+> 不要混淆。
 
 ---
 
 ## 8. 写入模式
 
 ### 8.1 创建向导（物化 DAG）
+
+**全部 6 步必须在同一事务内**——任何一步失败要整体回滚，避免"instance 创建了但节点行不齐"或
+"节点行建了但根节点还没置 READY"被外部观察到的中间态。
 
 ```
 1. SELECT template.definition（按 root_type + customer_type 选 active 最新版）
@@ -443,7 +472,11 @@ guide_node_status                 (per 节点; status / 完成时间 / 最新 ch
 4. INSERT creation_guide_instance（template_id + version 冻结；definition_snapshot 整块复制）
 5. INSERT N 行 guide_node_status（status=WAITING；owner **不存这里**，在 definition_snapshot 里）
 6. 入度=0 的节点：UPDATE status='READY', ready_at=NOW()
+   （"入度=0" = depends_on 数组为空 OR 字段缺失；见 SQL §5.4）
 ```
+
+> **同事务的副作用**：`creation_guide_instance.overall_status` 默认值 `INIT`（步骤 4 时），
+> 步骤 6 完成后外部读到的就是聚合后的 `INIT` 或 `IN_PROGRESS`（取决于根节点数量）。
 
 ### 8.2 推进 DAG（节点入终态时）
 
@@ -458,24 +491,55 @@ on_node_terminal(node_status):
         # 不推进后继，保持 WAITING
         pass
     update_overall_status(guide_instance_id)
+
+# retry 路径（FAILED → READY）独立触发：
+on_node_retry(node_status):
+    # FAILED 节点被 retry 后，自身回到 READY；子节点的 deps 仍是 READY（不是 DONE/SKIPPED），
+    # 按 §7 的子节点推进规则，子节点仍 WAITING。retry 仅恢复"重做"能力，不推进 DAG。
+    update_overall_status(guide_instance_id)
+
+# unblock 路径（BLOCKED → WAITING）独立触发：
+on_node_unblock(node_status):
+    node_status.status = 'WAITING'
+    # 两段 advance_dag：
+    #   1) 先评本节点：deps 全 DONE/SKIPPED 则 WAITING → READY
+    #   2) 再评子节点：依据本节点新状态 + 兄弟节点状态
+    if all(dep.status in (DONE, SKIPPED) for dep in node_status.depends_on):
+        node_status.status = 'READY'
+        node_status.ready_at = now()
+    for child in successors(node_status):
+        if all(dep.status in (DONE, SKIPPED) for dep in child.depends_on):
+            child.status = 'READY'
+            child.ready_at = now()
+    update_overall_status(guide_instance_id)
 ```
 
 `update_overall_status` 与状态变更**同事务**：
 
 ```sql
+-- 优先级: PARTIAL > READY > INIT > IN_PROGRESS
+-- CANCELLED 不通过此 SQL 派生, 走单独路径 (POST /guides/{id}/cancel)
 UPDATE creation_guide_instance
 SET overall_status = (
     SELECT CASE
-        WHEN SUM(status NOT IN ('DONE','SKIPPED','BLOCKED','FAILED')) > 0 THEN 'IN_PROGRESS'
+        -- 1. 任何 FAILED/BLOCKED -> PARTIAL (最高优先级)
         WHEN SUM(status IN ('FAILED','BLOCKED')) > 0 THEN 'PARTIAL'
+        -- 2. 全部节点都是 DONE/SKIPPED (无 WAITING/READY) -> READY
+        WHEN SUM(status NOT IN ('DONE','SKIPPED')) = 0 THEN 'READY'
+        -- 3. 全部节点都还在 WAITING (未被推进) -> INIT
         WHEN SUM(status = 'WAITING') = COUNT(*) THEN 'INIT'
-        ELSE 'READY'
+        -- 4. 其余 (有 READY, 或 WAITING+READY 混合) -> IN_PROGRESS
+        ELSE 'IN_PROGRESS'
     END
     FROM guide_node_status
     WHERE guide_instance_id = ?
 )
 WHERE guide_instance_id = ?;
 ```
+
+> **顺序敏感**：`PARTIAL` 必须在 `READY`/`INIT` 之前判断——否则有 FAILED 时会被第二条 (READY)
+> 或第三条 (INIT) 误判。原版 SQL 把 `IN_PROGRESS` 放最前，导致"全部 WAITING"也被判成 `IN_PROGRESS`，
+> 是顺序错误。
 
 ### 8.3 执行 Checkpoint
 
@@ -703,13 +767,19 @@ Idempotency-Key: req-uuid-zzz
 
 ### 9.5 状态机其他动作
 
-| 动作 | 路径 | 状态迁移 |
-|---|---|---|
-| Skip | `POST .../nodes/{key}/skip` | * → SKIPPED |
-| Failed | `POST .../nodes/{key}/failed` | * → FAILED |
-| Retry | `POST .../nodes/{key}/retry` | FAILED → READY |
-| Block | `POST .../nodes/{key}/block` | * → BLOCKED |
-| Unblock | `POST .../nodes/{key}/unblock` | BLOCKED → WAITING |
+> **源状态限制**：除 Retry / Unblock 外，所有 `* → X` 动作的源状态限定为
+> **`WAITING` 或 `READY`**（非终态）。终态（DONE / SKIPPED / FAILED / BLOCKED）不再接受
+> Skip / Failed / Block——避免"已 DONE 的节点又被 Block"这种语义无意义操作。
+> 跨过 `require_checkpoints_on_done` 校验的 DONE 是**不可逆**的，撤回要靠"开新向导"。
+
+| 动作 | 路径 | 状态迁移 | 副作用 |
+|---|---|---|---|
+| Skip | `POST .../nodes/{key}/skip` | `WAITING` / `READY` → `SKIPPED` | 推进子节点（advance_dag） |
+| Failed | `POST .../nodes/{key}/failed` | `WAITING` / `READY` → `FAILED` | 不推进子节点；`overall_status` 重新聚合（可能变 `PARTIAL`） |
+| Retry | `POST .../nodes/{key}/retry` | `FAILED` → `READY` | 触发 advance_dag（retry 后 dep=READY，**子节点仍 WAITING**直到 dep=DONE） |
+| Block | `POST .../nodes/{key}/block` | `WAITING` / `READY` → `BLOCKED` | 不推进子节点；`overall_status` 重新聚合 |
+| Unblock | `POST .../nodes/{key}/unblock` | `BLOCKED` → `WAITING` | **两段 advance_dag**：先评本节点 deps 满足则 WAITING→READY，再评子节点 |
+| **Cancel（instance 级）** | `POST /guides/{id}/cancel` | instance: * → `CANCELLED`（**与节点状态正交**） | 所有未终态节点冻结在原状态；不再接受任何节点动作（除 Retry 已 FAILED 的以外） |
 
 ### 9.6 Checkpoint 定义 CRUD
 
@@ -723,6 +793,28 @@ DELETE /checkpoints/customer/sales.account_exists     # 软删 (deprecated_at=NO
 
 > 软删而非硬删：避免节点模板中"已引用但找不到"导致 run 报 ERROR 时没有上下文。
 > 软删后的 checkpoint，run 时会落到 `result_status='ERROR'`，`error_code='CHECKPOINT_DEPRECATED'`。
+
+### 9.7 模板 CRUD
+
+模板既能从 YAML 文件加载（CI / 配置管理工具），也能从 Admin UI 录入。两条路径汇到同一组 API：
+
+```http
+GET    /templates                                     # 列出所有模板 (按 template_id + 最新版本)
+GET    /templates/{template_id}                      # 列出某 template_id 的所有版本
+GET    /templates/{template_id}/{version}            # 查一份模板的完整 definition
+POST   /templates                                     # 新建/新版本 (body = YAML 或 JSON, 服务端解析校验)
+                                                       # 服务端必须校验: 节点 key 唯一 / 依赖合法 / DAG 无环
+                                                       # 校验失败 -> 422, 返回 violations[]
+PUT    /templates/{template_id}/{version}/activate    # 切换 active 版本 (同一 template_id 下只允许一个 active)
+                                                       # 同 root_type + customer_type 已有 active 版本的, 旧的 is_active=0
+DELETE /templates/{template_id}/{version}            # 软删 (deprecated_at=NOW())
+                                                       # 已被 instance 引用的, 软删不影响已物化向导 (definition_snapshot 已冻结)
+                                                       # 不允许硬删
+```
+
+> **新版本自动叠加**：同一 `template_id` 可以有多个 `version`（PK = `(template_id, version)`）。
+> 不允许"原地改"——改模板必然是 `version + 1`。
+> `is_active=true` 同一 `(root_type, customer_type)` 下唯一；新客户走 active 版本，老客户走 instance 冻结的版本。
 
 ---
 
@@ -757,7 +849,20 @@ DELETE /checkpoints/customer/sales.account_exists     # 软删 (deprecated_at=NO
 | 连接断 | `ERROR` | `CONNECTION_FAILED` |
 | 慢查询 | `TIMEOUT` | `TIMEOUT` |
 | `status` 列非 PASS/FAIL | `ERROR` | `INVALID_RESULT` |
+| **返回 > 1 行**（违反"至多 1 行"协议） | `ERROR` | `INVALID_RESULT` |
 | 0 行返回 | `FAIL` | — |
+
+**`error_code` 字段约定**（写进 `guide_node_status.last_checkpoint_results` JSON）：
+
+| `result_status` | `error_code` 字段 | 含义 |
+|---|---|---|
+| `PASS` | `null` | 通过 |
+| `FAIL` | `null` | 业务规则未满足（数据问题） |
+| `ERROR` | 上面表中的非空 `error_code` | 探查机制故障（SQL 错 / 找不到 / 协议违反等） |
+| `TIMEOUT` | `TIMEOUT` | 慢查询 |
+
+> **PASS / FAIL 时 `error_code = null`**；**仅 ERROR / TIMEOUT** 才有非空 `error_code`。
+> 这样 UI 可以用 `error_code != null` 直接筛选"探查机制异常"与"业务规则失败"两类问题。
 
 ### 10.4 SQL 模板示例
 
@@ -867,8 +972,34 @@ master-service **不持有下游配置内容**——Done 接口返回 `last_chec
 ### 12.8 模板升级不要"在老实例上原地应用"
 
 `definition_snapshot` 冻结了老实例的视图。新版本模板只能影响**新创建**的向导；
-老向导要走显式"补齐"流程（在 v2 加节点时，生成补丁向导供老客户使用），
-**不能**直接 `UPDATE guide_node_status SET ...`。
+老向导要走显式"补齐"流程，**不能**直接 `UPDATE guide_node_status SET ...`。
+
+**补丁向导（patch guide）**端点：
+
+```http
+POST /business-objects/{root_type}/{root_id}/guides/{guide_instance_id}/patch
+Content-Type: application/json
+Idempotency-Key: req-uuid-patch
+
+{
+  "from_template_id": "customer_onboarding_v2",
+  "from_version": 5,
+  "to_version": 6,
+  "added_nodes": [                              # 模板 v6 比 v5 新增的节点
+    { "key": "crm.marketing_segment", ... }
+  ]
+}
+```
+
+服务端：
+1. 校验 v5/v6 模板的"差量"（added / removed / changed）—— 服务端**不能**自动 merge，
+   仅给运维/客服工具展示 diff；具体的"补齐节点"动作由人确认
+2. 创建一个**新**的 creation_guide_instance（`template_id` 用 `from_template_id + '_patch'`，`version` 用 `to_version`），
+   这个新 instance 的 `definition_snapshot` 只包含**新增**节点（不带旧节点，状态不重叠）
+3. 业务方在两个 instance 之间维护"并行进度"；老的 instance 完成时不影响新 instance
+
+> **不要自动 merge 节点到老 instance**：status / completed_at / completed_by 都是历史事实，
+> 自动 merge 会丢失审计。新老并存是合理设计。
 
 ### 12.9 不要把 checkpoint SQL 当脚本用
 

@@ -131,6 +131,7 @@ CREATE TABLE attr_value (
     UNIQUE KEY uk_current    (root_type, root_id, attr_key, seq_no, current_flag),
     KEY        idx_lookup    (root_type, root_id, attr_key, seq_no, valid_from, valid_to),
     KEY        idx_int       (root_type, attr_key, value_int),
+    KEY        idx_bigint    (root_type, attr_key, value_bigint),
     KEY        idx_dec       (root_type, attr_key, value_decimal),
     KEY        idx_datetime  (root_type, attr_key, value_datetime),
     KEY        idx_varchar   (root_type, attr_key, value_varchar(64)),
@@ -163,8 +164,10 @@ CREATE TABLE attr_value_current (
 
     PRIMARY KEY (root_type, root_id, attr_key, seq_no),
     KEY idx_int      (root_type, attr_key, value_int),
+    KEY idx_bigint   (root_type, attr_key, value_bigint),
     KEY idx_dec      (root_type, attr_key, value_decimal),
-    KEY idx_datetime (root_type, attr_key, value_datetime)
+    KEY idx_datetime (root_type, attr_key, value_datetime),
+    KEY idx_varchar  (root_type, attr_key, value_varchar(64))
 ) ENGINE=InnoDB COMMENT='当前生效视图,写入 attr_value 时同步';
 
 
